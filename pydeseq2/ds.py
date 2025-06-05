@@ -2,6 +2,7 @@ import sys
 import time
 import warnings
 from typing import Literal
+from typing import Tuple
 
 # import anndata as ad
 import numpy as np
@@ -14,7 +15,7 @@ from pydeseq2.default_inference import DefaultInference
 from pydeseq2.inference import Inference
 from pydeseq2.utils import lowess
 from pydeseq2.utils import make_MA_plot
-
+from pydeseq2.utils import lrt_test
 
 class DeseqStats:
     """PyDESeq2 statistical tests for differential expression.
@@ -131,6 +132,7 @@ class DeseqStats:
     def __init__(
         self,
         dds: DeseqDataSet,
+        test: Literal["wald", "LRT"] = "wald",
         contrast: list[str] | np.ndarray,
         alpha: float = 0.05,
         cooks_filter: bool = True,
@@ -149,6 +151,10 @@ class DeseqStats:
         ), "Please provide a fitted DeseqDataSet by first running the `deseq2` method."
 
         self.dds = dds
+
+        if test not in ("wald", "LRT"):
+            raise ValueError(f"Available tests are `wald` and `LRT`. Got: {test}.")
+        self.test = test
 
         self.alpha = alpha
         self.cooks_filter = cooks_filter
@@ -213,11 +219,22 @@ class DeseqStats:
                 "refitted. Please run 'dds.refit()' first or set 'dds.refit_cooks' "
                 "to False."
             )
+        
+        self.p_values: pd.Series
+        self.statistics: pd.Series
+        self.SE: pd.Series
+
+
+
+        
+
+
 
     @property
     def variables(self):
         """Get the names of the variables used in the model definition."""
         return self.dds.variables
+
 
     def summary(
         self,
@@ -262,6 +279,11 @@ class DeseqStats:
             rerun_summary = True
             self.run_wald_test()
 
+            if self.test == "wald":
+                self.run_wald_test()
+            else:
+                self.run_likelihood_ratio_test()
+
         if self.cooks_filter:
             # Filter p-values based on Cooks outliers
             self._cooks_filtering()
@@ -280,6 +302,8 @@ class DeseqStats:
         self.results_df["baseMean"] = self.base_mean
         self.results_df["log2FoldChange"] = self.LFC @ self.contrast_vector / np.log(2)
         self.results_df["lfcSE"] = self.SE / np.log(2)
+        if self.test == "wald":
+            self.results_df["lfcSE"] = self.SE / np.log(2)
         self.results_df["stat"] = self.statistics
         self.results_df["pvalue"] = self.p_values
         self.results_df["padj"] = self.padj
@@ -348,15 +372,84 @@ class DeseqStats:
         if not self.quiet:
             print(f"... done in {end-start:.2f} seconds.\n", file=sys.stderr)
 
-        self.p_values: pd.Series = pd.Series(pvals, index=self.dds.var_names)
-        self.statistics: pd.Series = pd.Series(stats, index=self.dds.var_names)
-        self.SE: pd.Series = pd.Series(se, index=self.dds.var_names)
+        self.p_values = pd.Series(pvals, index=self.dds.var_names)
+        self.statistics = pd.Series(stats, index=self.dds.var_names)
+        self.SE = pd.Series(se, index=self.dds.var_names)
 
         # Account for possible all_zeroes due to outlier refitting in DESeqDataSet
         if self.dds.refit_cooks and self.dds.varm["replaced"].sum() > 0:
             self.SE.loc[self.dds.new_all_zeroes_genes] = 0.0
             self.statistics.loc[self.dds.new_all_zeroes_genes] = 0.0
             self.p_values.loc[self.dds.new_all_zeroes_genes] = 1.0
+
+    def run_likelihood_ratio_test(self) -> None:
+        """Perform a Likelihood Ratio test.
+        Get gene-wise p-values for gene over/under-expression.
+        """
+
+        num_genes = self.dds.n_vars
+        num_vars = self.design_matrix.shape[1]
+
+        # XXX: Raise a warning if LFCs are shrunk.
+
+        def reduce(
+            design_matrix: np.ndarray, ridge_factor: np.ndarray
+        ) -> Tuple[np.ndarray, np.ndarray]:
+            indices = np.full(design_matrix.shape[1], True, dtype=bool)
+            indices[self.contrast_idx] = False
+            return design_matrix[:, indices], ridge_factor[:, indices][indices]
+
+        # Set regularization factors.
+        if self.prior_LFC_var is not None:
+            ridge_factor = np.diag(1 / self.prior_LFC_var**2)
+        else:
+            ridge_factor = np.diag(np.repeat(1e-6, num_vars))
+
+        design_matrix = self.design_matrix.values
+        LFCs = self.LFC.values
+
+        reduced_design_matrix, reduced_ridge_factor = reduce(design_matrix, ridge_factor)
+        self.dds.obsm["reduced_design_matrix"] = reduced_design_matrix
+
+        if not self.quiet:
+            print("Running LRT tests...", file=sys.stderr)
+        start = time.time()
+        with parallel_backend("loky", inner_max_num_threads=1):
+            res = Parallel(
+                n_jobs=self.n_processes,
+                verbose=self.joblib_verbosity,
+                batch_size=self.batch_size,
+            )(
+                delayed(lrt_test)(
+                    counts=self.dds.X[:, i],
+                    design_matrix=design_matrix,
+                    reduced_design_matrix=reduced_design_matrix,
+                    size_factors=self.dds.obsm["size_factors"],
+                    disp=self.dds.varm["dispersions"][i],
+                    lfc=LFCs[i],
+                    min_mu=self.dds.min_mu,
+                    ridge_factor=ridge_factor,
+                    reduced_ridge_factor=reduced_ridge_factor,
+                    beta_tol=self.dds.beta_tol,
+                )
+                for i in range(num_genes)
+            )
+        end = time.time()
+        if not self.quiet:
+            print(f"... done in {end-start:.2f} seconds.\n", file=sys.stderr)
+
+        pvals, stats = zip(*res)
+
+        self.p_values = pd.Series(pvals, index=self.dds.var_names)
+        self.statistics = pd.Series(stats, index=self.dds.var_names)
+
+        # Account for possible all_zeroes due to outlier refitting in DESeqDataSet
+        if self.dds.refit_cooks and self.dds.varm["replaced"].sum() > 0:
+            self.statistics.loc[self.dds.new_all_zeroes_genes] = 0.0
+            self.p_values.loc[self.dds.new_all_zeroes_genes] = 1.0
+
+
+
 
     # TODO update this to reflect the new contrast format
     def lfc_shrink(self, coeff: str, adapt: bool = True) -> None:
