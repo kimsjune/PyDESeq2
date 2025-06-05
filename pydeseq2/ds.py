@@ -133,18 +133,19 @@ class DeseqStats:
         self,
         dds: DeseqDataSet,
         test: Literal["wald", "LRT"] = "wald",
-        contrast: list[str] | np.ndarray,
+        contrast: Optional[List[str]] = None,
         alpha: float = 0.05,
         cooks_filter: bool = True,
         independent_filter: bool = True,
-        prior_LFC_var: np.ndarray | None = None,
+        n_cpus: Optional[int] = None,
+        prior_LFC_var: Optional[np.ndarray] = None,
         lfc_null: float = 0.0,
-        alt_hypothesis: (
-            Literal["greaterAbs", "lessAbs", "greater", "less"] | None
-        ) = None,
-        inference: Inference | None = None,
+        alt_hypothesis: Optional[
+            Literal["greaterAbs", "lessAbs", "greater", "less"]
+        ] = None,
+        batch_size: int = 128,
+        joblib_verbosity: int = 0,
         quiet: bool = False,
-        n_cpus: int | None = None,
     ) -> None:
         assert (
             "LFC" in dds.varm
